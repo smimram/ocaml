@@ -245,18 +245,18 @@ module LongString = struct
     tbl.(ind / Sys.max_string_length).[ind mod Sys.max_string_length]
 
   let set tbl ind c =
-    tbl.(ind / Sys.max_string_length).[ind mod Sys.max_string_length] <- c;
+    tbl.(ind / Sys.max_string_length).[ind mod Sys.max_string_length] <- c
 
   let blit src srcoff dst dstoff len =
     for i = 0 to len - 1 do set dst (dstoff + i) (get src (srcoff + i)) done
 
   let output oc tbl pos len =
-    for i = pos to pos + len - 1 do output_char oc (get tbl i) done;
+    for i = pos to pos + len - 1 do output_char oc (get tbl i) done
 
   let unsafe_blit src srcoff dst dstoff len =
     for i = 0 to len - 1 do
       String.unsafe_set dst (dstoff + i) (get src (srcoff + i))
-    done;
+    done
 
   let input_bytes ic len =
     let tbl = create len in
