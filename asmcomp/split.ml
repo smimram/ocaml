@@ -118,75 +118,79 @@ let find_exit_subst k =
     List.assoc k !exit_subst with
   | Not_found -> Misc.fatal_error "Split.find_exit_subst"
 
-let rec rename i sub =
+let rec rename i sub kont =
   match i.desc with
     Iend ->
-      (i, sub)
+      kont (i, sub)
   | Ireturn | Iop(Itailcall_ind) | Iop(Itailcall_imm _) ->
-      (instr_cons i.desc (subst_regs i.arg sub) [||] i.next,
-       None)
+      kont (instr_cons i.desc (subst_regs i.arg sub) [||] i.next,
+            None)
   | Iop Ireload when i.res.(0).loc = Unknown ->
       begin match sub with
-        None -> rename i.next sub
+        None -> rename i.next sub kont
       | Some s ->
           let oldr = i.res.(0) in
           let newr = Reg.clone i.res.(0) in
-          let (new_next, sub_next) =
-            rename i.next (Some(Reg.Map.add oldr newr s)) in
-          (instr_cons i.desc i.arg [|newr|] new_next,
-           sub_next)
+          rename i.next (Some(Reg.Map.add oldr newr s))
+            (fun (new_next, sub_next) ->
+          kont (instr_cons i.desc i.arg [|newr|] new_next, sub_next))
       end
   | Iop _ ->
-      let (new_next, sub_next) = rename i.next sub in
-      (instr_cons_debug i.desc (subst_regs i.arg sub) (subst_regs i.res sub)
-                        i.dbg new_next,
-       sub_next)
+      rename i.next sub (fun (new_next, sub_next) ->
+      kont (instr_cons_debug i.desc (subst_regs i.arg sub)
+              (subst_regs i.res sub) i.dbg new_next, sub_next))
   | Iifthenelse(tst, ifso, ifnot) ->
-      let (new_ifso, sub_ifso) = rename ifso sub in
-      let (new_ifnot, sub_ifnot) = rename ifnot sub in
-      let (new_next, sub_next) =
-        rename i.next (merge_substs sub_ifso sub_ifnot i.next) in
-      (instr_cons (Iifthenelse(tst, new_ifso, new_ifnot))
-                  (subst_regs i.arg sub) [||] new_next,
-       sub_next)
+      rename ifso sub (fun (new_ifso, sub_ifso) ->
+      rename ifnot sub (fun (new_ifnot, sub_ifnot) ->
+      rename i.next (merge_substs sub_ifso sub_ifnot i.next)
+        (fun (new_next, sub_next) ->
+      kont (instr_cons (Iifthenelse(tst, new_ifso, new_ifnot))
+                  (subst_regs i.arg sub) [||] new_next, sub_next))))
   | Iswitch(index, cases) ->
-      let new_sub_cases = Array.map (fun c -> rename c sub) cases in
+      let rec map cases kont = match cases with
+        | [] -> kont []
+        | case :: rest ->
+          rename case sub (fun x ->
+          map rest (fun y ->
+          kont (x :: y)))
+      in
+      map (Array.to_list cases) (fun new_sub_cases_lst ->
+      let new_sub_cases = Array.of_list new_sub_cases_lst in
       let sub_merge =
-        merge_subst_array (Array.map (fun (n, s) -> s) new_sub_cases) i.next in
-      let (new_next, sub_next) = rename i.next sub_merge in
-      (instr_cons (Iswitch(index, Array.map (fun (n, s) -> n) new_sub_cases))
-                  (subst_regs i.arg sub) [||] new_next,
-       sub_next)
+        merge_subst_array (Array.map (fun (n, s) -> s) new_sub_cases) i.next
+      in
+      rename i.next sub_merge (fun (new_next, sub_next) ->
+      kont (instr_cons (Iswitch(index,Array.map (fun (n,s) -> n) new_sub_cases))
+              (subst_regs i.arg sub) [||] new_next, sub_next)))
   | Iloop(body) ->
-      let (new_body, sub_body) = rename body sub in
-      let (new_next, sub_next) = rename i.next (merge_substs sub sub_body i) in
-      (instr_cons (Iloop(new_body)) [||] [||] new_next,
-       sub_next)
+      rename body sub (fun (new_body, sub_body) ->
+      rename i.next (merge_substs sub sub_body i) (fun (new_next, sub_next) ->
+      kont (instr_cons (Iloop(new_body)) [||] [||] new_next, sub_next)))
   | Icatch(nfail, body, handler) ->
       let new_subst = ref None in
       exit_subst := (nfail, new_subst) :: !exit_subst ;
-      let (new_body, sub_body) = rename body sub in
+      rename body sub (fun (new_body, sub_body) ->
       let sub_entry_handler = !new_subst in
       exit_subst := List.tl !exit_subst;
-      let (new_handler, sub_handler) = rename handler sub_entry_handler in
-      let (new_next, sub_next) =
-        rename i.next (merge_substs sub_body sub_handler i.next) in
-      (instr_cons (Icatch(nfail, new_body, new_handler)) [||] [||] new_next,
-       sub_next)
+      rename handler sub_entry_handler (fun (new_handler, sub_handler) ->
+      rename i.next (merge_substs sub_body sub_handler i.next)
+        (fun (new_next, sub_next) ->
+      kont (instr_cons (Icatch(nfail, new_body, new_handler)) [||] [||]
+              new_next, sub_next))))
   | Iexit nfail ->
       let r = find_exit_subst nfail in
       r := merge_substs !r sub i;
-      (i, None)
+      kont (i, None)
   | Itrywith(body, handler) ->
-      let (new_body, sub_body) = rename body sub in
-      let (new_handler, sub_handler) = rename handler sub in
-      let (new_next, sub_next) =
-        rename i.next (merge_substs sub_body sub_handler i.next) in
-      (instr_cons (Itrywith(new_body, new_handler)) [||] [||] new_next,
-       sub_next)
+      rename body sub (fun (new_body, sub_body) ->
+      rename handler sub (fun (new_handler, sub_handler) ->
+      rename i.next (merge_substs sub_body sub_handler i.next)
+        (fun (new_next, sub_next) ->
+      kont (instr_cons (Itrywith(new_body, new_handler)) [||] [||] new_next,
+            sub_next))))
   | Iraise ->
-      (instr_cons_debug Iraise (subst_regs i.arg sub) [||] i.dbg i.next,
-       None)
+      kont (instr_cons_debug Iraise (subst_regs i.arg sub) [||] i.dbg i.next,
+            None)
 
 (* Second pass: replace registers by their final representatives *)
 
@@ -198,7 +202,7 @@ let set_repres i =
 let fundecl f =
   equiv_classes := Reg.Map.empty;
   let new_args = Array.copy f.fun_args in
-  let (new_body, sub_body) = rename f.fun_body (Some Reg.Map.empty) in
+  rename f.fun_body (Some Reg.Map.empty) (fun (new_body, sub_body) ->
   repres_regs new_args;
   set_repres new_body;
   equiv_classes := Reg.Map.empty;
@@ -206,4 +210,4 @@ let fundecl f =
     fun_args = new_args;
     fun_body = new_body;
     fun_fast = f.fun_fast;
-    fun_dbg  = f.fun_dbg }
+    fun_dbg  = f.fun_dbg })

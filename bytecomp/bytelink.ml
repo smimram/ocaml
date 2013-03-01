@@ -192,14 +192,14 @@ let debug_info = ref ([] : (int * string) list)
 let link_compunit ppf output_fun currpos_fun inchan file_name compunit =
   check_consistency ppf file_name compunit;
   seek_in inchan compunit.cu_pos;
-  let code_block = input_bytes inchan compunit.cu_codesize in
-  Symtable.patch_object code_block compunit.cu_reloc;
+  let code_block = LongString.input_bytes inchan compunit.cu_codesize in
+  Symtable.ls_patch_object code_block compunit.cu_reloc;
   if !Clflags.debug && compunit.cu_debug > 0 then begin
     seek_in inchan compunit.cu_debug;
     let buffer = input_bytes inchan compunit.cu_debugsize in
     debug_info := (currpos_fun(), buffer) :: !debug_info
   end;
-  output_fun code_block;
+  Array.iter output_fun code_block;
   if !Clflags.link_everything then
     List.iter Symtable.require_primitive compunit.cu_primitives
 

@@ -25,64 +25,72 @@ let allocated_size = function
     No_alloc -> 0
   | Pending_alloc(reg, ofs) -> ofs
 
-let rec combine i allocstate =
+let rec combine i allocstate kont =
   match i.desc with
     Iend | Ireturn | Iexit _ | Iraise ->
-      (i, allocated_size allocstate)
+      kont (i, allocated_size allocstate)
   | Iop(Ialloc sz) ->
       begin match allocstate with
         No_alloc ->
-          let (newnext, newsz) =
-            combine i.next (Pending_alloc(i.res.(0), sz)) in
-          (instr_cons (Iop(Ialloc newsz)) i.arg i.res newnext, 0)
+          combine i.next (Pending_alloc(i.res.(0), sz)) (fun (newnext, newsz) ->
+          kont (instr_cons (Iop(Ialloc newsz)) i.arg i.res newnext, 0))
       | Pending_alloc(reg, ofs) ->
           if ofs + sz < Config.max_young_wosize * Arch.size_addr then begin
-            let (newnext, newsz) =
-              combine i.next (Pending_alloc(reg, ofs + sz)) in
-            (instr_cons (Iop(Iintop_imm(Iadd, ofs))) [| reg |] i.res newnext,
-             newsz)
+            combine i.next (Pending_alloc(reg, ofs + sz))
+              (fun (newnext, newsz) ->
+                kont (instr_cons (Iop(Iintop_imm(Iadd, ofs))) [| reg |]
+                        i.res newnext, newsz))
           end else begin
-            let (newnext, newsz) =
-              combine i.next (Pending_alloc(i.res.(0), sz)) in
-            (instr_cons (Iop(Ialloc newsz)) i.arg i.res newnext, ofs)
+            combine i.next (Pending_alloc(i.res.(0), sz))
+              (fun (newnext, newsz) ->
+                kont (instr_cons (Iop(Ialloc newsz)) i.arg i.res newnext, ofs))
           end
       end
   | Iop(Icall_ind | Icall_imm _ | Iextcall _ |
         Itailcall_ind | Itailcall_imm _) ->
-      let newnext = combine_restart i.next in
-      (instr_cons_debug i.desc i.arg i.res i.dbg newnext,
-       allocated_size allocstate)
+      combine_restart i.next (fun newnext ->
+      kont (instr_cons_debug i.desc i.arg i.res i.dbg newnext,
+            allocated_size allocstate))
   | Iop op ->
-      let (newnext, sz) = combine i.next allocstate in
-      (instr_cons_debug i.desc i.arg i.res i.dbg newnext, sz)
+      combine i.next allocstate (fun (newnext, sz) ->
+      kont (instr_cons_debug i.desc i.arg i.res i.dbg newnext, sz))
   | Iifthenelse(test, ifso, ifnot) ->
-      let newifso = combine_restart ifso in
-      let newifnot = combine_restart ifnot in
-      let newnext = combine_restart i.next in
-      (instr_cons (Iifthenelse(test, newifso, newifnot)) i.arg i.res newnext,
-       allocated_size allocstate)
+      combine_restart ifso (fun newifso ->
+      combine_restart ifnot (fun newifnot ->
+      combine_restart i.next (fun newnext ->
+      kont (instr_cons (Iifthenelse(test, newifso, newifnot))
+              i.arg i.res newnext, allocated_size allocstate))))
   | Iswitch(table, cases) ->
-      let newcases = Array.map combine_restart cases in
-      let newnext = combine_restart i.next in
-      (instr_cons (Iswitch(table, newcases)) i.arg i.res newnext,
-       allocated_size allocstate)
+    let rec map l kont = match l with
+      | [] -> kont []
+      | hd :: tl ->
+        combine_restart hd (fun x ->
+        map tl (fun y ->
+        kont (x :: y)))
+    in
+    map (Array.to_list cases) (fun newcases ->
+    combine_restart i.next (fun newnext ->
+    kont (instr_cons (Iswitch(table, Array.of_list newcases))
+            i.arg i.res newnext, allocated_size allocstate)))
   | Iloop(body) ->
-      let newbody = combine_restart body in
-      (instr_cons (Iloop(newbody)) i.arg i.res i.next,
-       allocated_size allocstate)
+      combine_restart body (fun newbody ->
+      kont (instr_cons (Iloop(newbody)) i.arg i.res i.next,
+            allocated_size allocstate))
   | Icatch(io, body, handler) ->
-      let (newbody, sz) = combine body allocstate in
-      let newhandler = combine_restart handler in
-      let newnext = combine_restart i.next in
-      (instr_cons (Icatch(io, newbody, newhandler)) i.arg i.res newnext, sz)
+      combine body allocstate (fun (newbody, sz) ->
+      combine_restart handler (fun newhandler ->
+      combine_restart i.next (fun newnext ->
+      kont (instr_cons (Icatch(io, newbody, newhandler))
+              i.arg i.res newnext, sz))))
   | Itrywith(body, handler) ->
-      let (newbody, sz) = combine body allocstate in
-      let newhandler = combine_restart handler in
-      let newnext = combine_restart i.next in
-      (instr_cons (Itrywith(newbody, newhandler)) i.arg i.res newnext, sz)
+      combine body allocstate (fun (newbody, sz) ->
+      combine_restart handler (fun newhandler ->
+      combine_restart i.next (fun newnext ->
+      kont (instr_cons (Itrywith(newbody, newhandler))
+              i.arg i.res newnext, sz))))
 
-and combine_restart i =
-  let (newi, _) = combine i No_alloc in newi
+and combine_restart i kont =
+  combine i No_alloc (fun (newi, _) -> kont newi)
 
 let fundecl f =
-  {f with fun_body = combine_restart f.fun_body}
+  combine_restart f.fun_body (fun r -> {f with fun_body = r})

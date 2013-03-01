@@ -82,58 +82,73 @@ method reload_operation op arg res =
 method reload_test tst args =
   self#makeregs args
 
-method private reload i =
+method private reload i kont =
   match i.desc with
     (* For function calls, returns, etc: the arguments and results are
        already at the correct position (e.g. on stack for some arguments).
        However, something needs to be done for the function pointer in
        indirect calls. *)
-    Iend | Ireturn | Iop(Itailcall_imm _) | Iraise -> i
+    Iend | Ireturn | Iop(Itailcall_imm _) | Iraise -> kont i
   | Iop(Itailcall_ind) ->
       let newarg = self#makereg1 i.arg in
-      insert_moves i.arg newarg
-        {i with arg = newarg}
+      kont (insert_moves i.arg newarg {i with arg = newarg})
   | Iop(Icall_imm _ | Iextcall _) ->
-      {i with next = self#reload i.next}
+      self#reload i.next (fun nxt -> kont {i with next = nxt})
   | Iop(Icall_ind) ->
       let newarg = self#makereg1 i.arg in
-      insert_moves i.arg newarg
-        {i with arg = newarg; next = self#reload i.next}
+      self#reload i.next (fun nxt ->
+      kont (insert_moves i.arg newarg {i with arg = newarg; next = nxt}))
   | Iop op ->
       let (newarg, newres) = self#reload_operation op i.arg i.res in
-      insert_moves i.arg newarg
-        {i with arg = newarg; res = newres; next =
-          (insert_moves newres i.res
-            (self#reload i.next))}
+      self#reload i.next (fun nxt ->
+      kont (insert_moves i.arg newarg
+              {i with arg = newarg; res = newres; next =
+                  (insert_moves newres i.res nxt)}))
   | Iifthenelse(tst, ifso, ifnot) ->
       let newarg = self#reload_test tst i.arg in
-      insert_moves i.arg newarg
-        (instr_cons
-          (Iifthenelse(tst, self#reload ifso, self#reload ifnot)) newarg [||]
-          (self#reload i.next))
+      self#reload ifso (fun nxt_ifso ->
+      self#reload ifnot (fun nxt_ifnot ->
+      self#reload i.next (fun nxt ->
+      kont (insert_moves i.arg newarg
+              (instr_cons (Iifthenelse(tst, nxt_ifso, nxt_ifnot))
+                 newarg [||] nxt)))))
   | Iswitch(index, cases) ->
+      let rec map cases kont = match cases with
+        | [] -> kont []
+        | case :: rest ->
+          self#reload case (fun x ->
+          map rest (fun y ->
+          kont (x :: y)))
+      in
       let newarg = self#makeregs i.arg in
-      insert_moves i.arg newarg
-        (instr_cons (Iswitch(index, Array.map (self#reload) cases)) newarg [||]
-          (self#reload i.next))
+      map (Array.to_list cases) (fun new_cases ->
+      self#reload i.next (fun new_nxt ->
+      kont (insert_moves i.arg newarg
+              (instr_cons (Iswitch(index, Array.of_list new_cases)) newarg [||]
+                 new_nxt))))
   | Iloop body ->
-      instr_cons (Iloop(self#reload body)) [||] [||] (self#reload i.next)
+      self#reload body (fun new_body ->
+      self#reload i.next (fun new_nxt ->
+      kont (instr_cons (Iloop(new_body)) [||] [||] new_nxt)))
   | Icatch(nfail, body, handler) ->
-      instr_cons
-        (Icatch(nfail, self#reload body, self#reload handler)) [||] [||]
-        (self#reload i.next)
+      self#reload body (fun new_body ->
+      self#reload handler (fun new_handler ->
+      self#reload i.next (fun new_nxt ->
+      kont (instr_cons(Icatch(nfail,new_body,new_handler)) [||] [||] new_nxt))))
   | Iexit i ->
-      instr_cons (Iexit i) [||] [||] dummy_instr
+      kont (instr_cons (Iexit i) [||] [||] dummy_instr)
   | Itrywith(body, handler) ->
-      instr_cons (Itrywith(self#reload body, self#reload handler)) [||] [||]
-        (self#reload i.next)
+      self#reload body (fun new_body ->
+      self#reload handler (fun new_handler ->
+      self#reload i.next (fun new_nxt ->
+      kont (instr_cons (Itrywith(new_body, new_handler)) [||] [||] new_nxt))))
 
 method fundecl f =
   redo_regalloc <- false;
-  let new_body = self#reload f.fun_body in
+  self#reload f.fun_body (fun new_body ->
   ({fun_name = f.fun_name; fun_args = f.fun_args;
     fun_body = new_body; fun_fast = f.fun_fast;
     fun_dbg  = f.fun_dbg},
-   redo_regalloc)
+   redo_regalloc))
 
 end

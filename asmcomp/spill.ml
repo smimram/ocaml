@@ -131,22 +131,22 @@ let find_reload_at_exit k =
 
 let reload_at_break = ref Reg.Set.empty
 
-let rec reload i before =
+let rec reload i before kont =
   incr current_date;
   record_use i.arg;
   record_use i.res;
   match i.desc with
     Iend ->
-      (i, before)
+      kont (i, before)
   | Ireturn | Iop(Itailcall_ind) | Iop(Itailcall_imm _) ->
-      (add_reloads (Reg.inter_set_array before i.arg) i,
-       Reg.Set.empty)
+      kont (add_reloads (Reg.inter_set_array before i.arg) i,
+            Reg.Set.empty)
   | Iop(Icall_ind | Icall_imm _ | Iextcall(_, true)) ->
       (* All regs live across must be spilled *)
-      let (new_next, finally) = reload i.next i.live in
-      (add_reloads (Reg.inter_set_array before i.arg)
-                   (instr_cons_debug i.desc i.arg i.res i.dbg new_next),
-       finally)
+      reload i.next i.live (fun (new_next, finally) ->
+      kont (add_reloads (Reg.inter_set_array before i.arg)
+              (instr_cons_debug i.desc i.arg i.res i.dbg new_next),
+            finally))
   | Iop op ->
       let new_before =
         (* Quick check to see if the register pressure is below the maximum *)
@@ -156,90 +156,84 @@ let rec reload i before =
         else add_superpressure_regs op i.live i.res before in
       let after =
         Reg.diff_set_array (Reg.diff_set_array new_before i.arg) i.res in
-      let (new_next, finally) = reload i.next after in
-      (add_reloads (Reg.inter_set_array new_before i.arg)
-                   (instr_cons_debug i.desc i.arg i.res i.dbg new_next),
-       finally)
+      reload i.next after (fun (new_next, finally) ->
+        kont (add_reloads (Reg.inter_set_array new_before i.arg)
+                (instr_cons_debug i.desc i.arg i.res i.dbg new_next),
+              finally))
   | Iifthenelse(test, ifso, ifnot) ->
       let at_fork = Reg.diff_set_array before i.arg in
       let date_fork = !current_date in
-      let (new_ifso, after_ifso) = reload ifso at_fork in
+      reload ifso at_fork (fun (new_ifso, after_ifso) ->
       let date_ifso = !current_date in
       current_date := date_fork;
-      let (new_ifnot, after_ifnot) = reload ifnot at_fork in
+      reload ifnot at_fork (fun (new_ifnot, after_ifnot) ->
       current_date := max date_ifso !current_date;
-      let (new_next, finally) =
-        reload i.next (Reg.Set.union after_ifso after_ifnot) in
+      reload i.next (Reg.Set.union after_ifso after_ifnot)
+        (fun (new_next, finally) ->
       let new_i =
         instr_cons (Iifthenelse(test, new_ifso, new_ifnot))
         i.arg i.res new_next in
       destroyed_at_fork := (new_i, at_fork) :: !destroyed_at_fork;
-      (add_reloads (Reg.inter_set_array before i.arg) new_i,
-       finally)
+      kont (add_reloads (Reg.inter_set_array before i.arg) new_i,
+            finally))))
   | Iswitch(index, cases) ->
       let at_fork = Reg.diff_set_array before i.arg in
       let date_fork = !current_date in
       let date_join = ref 0 in
       let after_cases = ref Reg.Set.empty in
-      let new_cases =
-        Array.map
-          (fun c ->
-            current_date := date_fork;
-            let (new_c, after_c) = reload c at_fork in
-            after_cases := Reg.Set.union !after_cases after_c;
-            date_join := max !date_join !current_date;
-            new_c)
-          cases in
+      let rec map cases kont = match cases with
+        | [] -> kont []
+        | c :: rest ->
+          current_date := date_fork;
+          reload c at_fork (fun (new_c, after_c) ->
+          after_cases := Reg.Set.union !after_cases after_c;
+          date_join := max !date_join !current_date;
+          map rest (fun new_rest ->
+          kont (new_c :: new_rest)))
+      in
+      map (Array.to_list cases) (fun new_cases ->
       current_date := !date_join;
-      let (new_next, finally) = reload i.next !after_cases in
-      (add_reloads (Reg.inter_set_array before i.arg)
-                   (instr_cons (Iswitch(index, new_cases))
-                               i.arg i.res new_next),
-       finally)
+      reload i.next !after_cases (fun (new_next, finally) ->
+      kont (add_reloads (Reg.inter_set_array before i.arg)
+              (instr_cons (Iswitch(index, Array.of_list new_cases))
+                 i.arg i.res new_next), finally)))
   | Iloop(body) ->
       let date_start = !current_date in
-      let at_head = ref before in
-      let final_body = ref body in
-      begin try
-        while true do
-          current_date := date_start;
-          let (new_body, new_at_head) = reload body !at_head in
-          let merged_at_head = Reg.Set.union !at_head new_at_head in
-          if Reg.Set.equal merged_at_head !at_head then begin
-            final_body := new_body;
-            raise Exit
-          end;
-          at_head := merged_at_head
-        done
-      with Exit -> ()
-      end;
-      let (new_next, finally) = reload i.next Reg.Set.empty in
-      (instr_cons (Iloop(!final_body)) i.arg i.res new_next,
-       finally)
+      let rec fold at_head kont =
+        current_date := date_start;
+        reload body at_head (fun (new_body, new_at_head) ->
+        let merged_at_head = Reg.Set.union at_head new_at_head in
+        if Reg.Set.equal merged_at_head at_head then kont new_body
+        else fold merged_at_head kont)
+      in
+      fold before (fun final_body ->
+      reload i.next Reg.Set.empty (fun (new_next, finally) ->
+      kont (instr_cons (Iloop(final_body)) i.arg i.res new_next,
+            finally)))
   | Icatch(nfail, body, handler) ->
       let new_set = ref Reg.Set.empty in
       reload_at_exit := (nfail, new_set) :: !reload_at_exit ;
-      let (new_body, after_body) = reload body before in
+      reload body before (fun (new_body, after_body) ->
       let at_exit = !new_set in
       reload_at_exit := List.tl !reload_at_exit ;
-      let (new_handler, after_handler) = reload handler at_exit in
-      let (new_next, finally) =
-        reload i.next (Reg.Set.union after_body after_handler) in
-      (instr_cons (Icatch(nfail, new_body, new_handler)) i.arg i.res new_next,
-       finally)
+      reload handler at_exit (fun (new_handler, after_handler) ->
+      reload i.next (Reg.Set.union after_body after_handler)
+        (fun (new_next, finally) ->
+      kont (instr_cons (Icatch(nfail, new_body, new_handler))
+              i.arg i.res new_next, finally))))
   | Iexit nfail ->
       let set = find_reload_at_exit nfail in
       set := Reg.Set.union !set before;
-      (i, Reg.Set.empty)
+      kont (i, Reg.Set.empty)
   | Itrywith(body, handler) ->
-      let (new_body, after_body) = reload body before in
-      let (new_handler, after_handler) = reload handler handler.live in
-      let (new_next, finally) =
-        reload i.next (Reg.Set.union after_body after_handler) in
-      (instr_cons (Itrywith(new_body, new_handler)) i.arg i.res new_next,
-       finally)
+      reload body before (fun (new_body, after_body) ->
+      reload handler handler.live (fun (new_handler, after_handler) ->
+      reload i.next (Reg.Set.union after_body after_handler)
+        (fun (new_next, finally) ->
+      kont (instr_cons (Itrywith(new_body, new_handler)) i.arg i.res new_next,
+            finally))))
   | Iraise ->
-      (add_reloads (Reg.inter_set_array before i.arg) i, Reg.Set.empty)
+      kont (add_reloads (Reg.inter_set_array before i.arg) i, Reg.Set.empty)
 
 (* Second pass: add spill instructions based on what we've decided to reload.
    That is, any register that may be reloaded in the future must be spilled
@@ -274,113 +268,108 @@ let add_spills regset i =
     (fun r i -> instr_cons (Iop Ispill) [|r|] [|spill_reg r|] i)
     regset i
 
-let rec spill i finally =
+let rec spill i finally kont =
   match i.desc with
     Iend ->
-      (i, finally)
+      kont (i, finally)
   | Ireturn | Iop(Itailcall_ind) | Iop(Itailcall_imm _) ->
-      (i, Reg.Set.empty)
+      kont (i, Reg.Set.empty)
   | Iop Ireload ->
-      let (new_next, after) = spill i.next finally in
+      spill i.next finally (fun (new_next, after) ->
       let before1 = Reg.diff_set_array after i.res in
-      (instr_cons i.desc i.arg i.res new_next,
-       Reg.add_set_array before1 i.res)
+      kont (instr_cons i.desc i.arg i.res new_next,
+            Reg.add_set_array before1 i.res))
   | Iop _ ->
-      let (new_next, after) = spill i.next finally in
+      spill i.next finally (fun (new_next, after) ->
       let before1 = Reg.diff_set_array after i.res in
       let before =
         match i.desc with
-          Iop Icall_ind | Iop(Icall_imm _) | Iop(Iextcall _)
-        | Iop(Iintop Icheckbound) | Iop(Iintop_imm(Icheckbound, _)) ->
+            Iop Icall_ind | Iop(Icall_imm _) | Iop(Iextcall _)
+          | Iop(Iintop Icheckbound) | Iop(Iintop_imm(Icheckbound, _)) ->
             Reg.Set.union before1 !spill_at_raise
-        | _ ->
-            before1 in
-      (instr_cons_debug i.desc i.arg i.res i.dbg
-                  (add_spills (Reg.inter_set_array after i.res) new_next),
-       before)
+          | _ ->
+            before1
+      in
+      kont (instr_cons_debug i.desc i.arg i.res i.dbg
+              (add_spills (Reg.inter_set_array after i.res) new_next),
+            before))
   | Iifthenelse(test, ifso, ifnot) ->
-      let (new_next, at_join) = spill i.next finally in
-      let (new_ifso, before_ifso) = spill ifso at_join in
-      let (new_ifnot, before_ifnot) = spill ifnot at_join in
-      if
-        !inside_loop || !inside_arm
-      then
-        (instr_cons (Iifthenelse(test, new_ifso, new_ifnot))
-                     i.arg i.res new_next,
-         Reg.Set.union before_ifso before_ifnot)
+      spill i.next finally (fun (new_next, at_join) ->
+      spill ifso at_join (fun (new_ifso, before_ifso) ->
+      spill ifnot at_join (fun (new_ifnot, before_ifnot) ->
+      if !inside_loop || !inside_arm then
+        kont (instr_cons (Iifthenelse(test, new_ifso, new_ifnot))
+                i.arg i.res new_next,
+              Reg.Set.union before_ifso before_ifnot)
       else begin
         let destroyed = List.assq i !destroyed_at_fork in
         let spill_ifso_branch =
           Reg.Set.diff (Reg.Set.diff before_ifso before_ifnot) destroyed
         and spill_ifnot_branch =
           Reg.Set.diff (Reg.Set.diff before_ifnot before_ifso) destroyed in
-        (instr_cons
-            (Iifthenelse(test, add_spills spill_ifso_branch new_ifso,
-                               add_spills spill_ifnot_branch new_ifnot))
-            i.arg i.res new_next,
-         Reg.Set.diff (Reg.Set.diff (Reg.Set.union before_ifso before_ifnot)
-                                    spill_ifso_branch)
-                       spill_ifnot_branch)
-      end
+        kont(instr_cons
+               (Iifthenelse(test, add_spills spill_ifso_branch new_ifso,
+                            add_spills spill_ifnot_branch new_ifnot))
+               i.arg i.res new_next,
+             Reg.Set.diff (Reg.Set.diff (Reg.Set.union before_ifso before_ifnot)
+                             spill_ifso_branch)
+               spill_ifnot_branch)
+      end)))
   | Iswitch(index, cases) ->
-      let (new_next, at_join) = spill i.next finally in
+      spill i.next finally (fun (new_next, at_join) ->
       let saved_inside_arm = !inside_arm in
       inside_arm := true ;
       let before = ref Reg.Set.empty in
-      let new_cases =
-        Array.map
-          (fun c ->
-            let (new_c, before_c) = spill c at_join in
-            before := Reg.Set.union !before before_c;
-            new_c)
-          cases in
+      let rec map cases kont = match cases with
+        | [] -> kont []
+        | c :: rest ->
+          spill c at_join (fun (new_c, before_c) ->
+          before := Reg.Set.union !before before_c;
+          map rest (fun new_rest ->
+          kont (new_c :: new_rest)))
+      in
+      map (Array.to_list cases) (fun new_cases ->
       inside_arm := saved_inside_arm ;
-      (instr_cons (Iswitch(index, new_cases)) i.arg i.res new_next,
-       !before)
+      kont (instr_cons (Iswitch(index, Array.of_list new_cases))
+              i.arg i.res new_next, !before)))
   | Iloop(body) ->
-      let (new_next, _) = spill i.next finally in
+      spill i.next finally (fun (new_next, _) ->
       let saved_inside_loop = !inside_loop in
       inside_loop := true;
-      let at_head = ref Reg.Set.empty in
-      let final_body = ref body in
-      begin try
-        while true do
-          let (new_body, before_body) = spill body !at_head in
-          let new_at_head = Reg.Set.union !at_head before_body in
-          if Reg.Set.equal new_at_head !at_head then begin
-            final_body := new_body; raise Exit
-          end;
-          at_head := new_at_head
-        done
-      with Exit -> ()
-      end;
+      let rec fold at_head kont =
+        spill body at_head (fun (new_body, before_body) ->
+        let new_at_head = Reg.Set.union at_head before_body in
+        if Reg.Set.equal new_at_head at_head then kont (new_body, at_head)
+        else fold new_at_head kont)
+      in
+      fold Reg.Set.empty (fun (final_body, at_head) ->
       inside_loop := saved_inside_loop;
-      (instr_cons (Iloop(!final_body)) i.arg i.res new_next,
-       !at_head)
+      kont (instr_cons (Iloop(final_body)) i.arg i.res new_next,
+            at_head)))
   | Icatch(nfail, body, handler) ->
-      let (new_next, at_join) = spill i.next finally in
-      let (new_handler, at_exit) = spill handler at_join in
+      spill i.next finally (fun (new_next, at_join) ->
+      spill handler at_join (fun (new_handler, at_exit) ->
       let saved_inside_catch = !inside_catch in
       inside_catch := true ;
       spill_at_exit := (nfail, at_exit) :: !spill_at_exit ;
-      let (new_body, before) = spill body at_join in
+      spill body at_join (fun (new_body, before) ->
       spill_at_exit := List.tl !spill_at_exit;
-      inside_catch := saved_inside_catch ;
-      (instr_cons (Icatch(nfail, new_body, new_handler)) i.arg i.res new_next,
-       before)
+      inside_catch := saved_inside_catch;
+      kont (instr_cons (Icatch(nfail, new_body, new_handler))
+              i.arg i.res new_next, before))))
   | Iexit nfail ->
-      (i, find_spill_at_exit nfail)
+      kont (i, find_spill_at_exit nfail)
   | Itrywith(body, handler) ->
-      let (new_next, at_join) = spill i.next finally in
-      let (new_handler, before_handler) = spill handler at_join in
+      spill i.next finally (fun (new_next, at_join) ->
+      spill handler at_join (fun (new_handler, before_handler) ->
       let saved_spill_at_raise = !spill_at_raise in
       spill_at_raise := before_handler;
-      let (new_body, before_body) = spill body at_join in
+      spill body at_join (fun (new_body, before_body) ->
       spill_at_raise := saved_spill_at_raise;
-      (instr_cons (Itrywith(new_body, new_handler)) i.arg i.res new_next,
-       before_body)
+        kont (instr_cons (Itrywith(new_body, new_handler)) i.arg i.res new_next,
+              before_body))))
   | Iraise ->
-      (i, !spill_at_raise)
+      kont (i, !spill_at_raise)
 
 (* Entry point *)
 
@@ -388,8 +377,8 @@ let fundecl f =
   spill_env := Reg.Map.empty;
   use_date := Reg.Map.empty;
   current_date := 0;
-  let (body1, _) = reload f.fun_body Reg.Set.empty in
-  let (body2, tospill_at_entry) = spill body1 Reg.Set.empty in
+  reload f.fun_body Reg.Set.empty (fun (body1, _) ->
+  spill body1 Reg.Set.empty (fun (body2, tospill_at_entry) ->
   let new_body =
     add_spills (Reg.inter_set_array tospill_at_entry f.fun_args) body2 in
   spill_env := Reg.Map.empty;
@@ -398,4 +387,4 @@ let fundecl f =
     fun_args = f.fun_args;
     fun_body = new_body;
     fun_fast = f.fun_fast;
-    fun_dbg  = f.fun_dbg }
+    fun_dbg  = f.fun_dbg }))
